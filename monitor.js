@@ -20,34 +20,17 @@ function formatResetTime(isoString) {
   }
 }
 
-function calculatePercentage(utilization, type) {
-  const limits = {
-    'five_hour': 100,
-    'seven_day': 100,
-    'seven_day_opus': 100,
-    'seven_day_oauth_apps': 100
-  };
-
-  const limit = limits[type] || 100;
-  return Math.min((utilization / limit) * 100, 100);
-}
-
 // Calculate expected usage percentage based on time elapsed
-function calculateExpectedPercentage(resetAt, type) {
+function calculateExpectedPercentage(resetAt, group) {
   if (!resetAt) return 0;
 
   const resetDate = new Date(resetAt);
   const now = new Date();
 
-  // Calculate total period in milliseconds
-  const periodDurations = {
-    'five_hour': 5 * 60 * 60 * 1000,
-    'seven_day': 7 * 24 * 60 * 60 * 1000,
-    'seven_day_opus': 7 * 24 * 60 * 60 * 1000,
-    'seven_day_oauth_apps': 7 * 24 * 60 * 60 * 1000
-  };
-
-  const totalPeriod = periodDurations[type] || (7 * 24 * 60 * 60 * 1000);
+  // Session limits reset every 5 hours; all other limits are weekly
+  const totalPeriod = group === 'session'
+    ? 5 * 60 * 60 * 1000
+    : 7 * 24 * 60 * 60 * 1000;
 
   // Calculate elapsed time
   const timeRemaining = resetDate - now;
@@ -61,15 +44,16 @@ function calculateExpectedPercentage(resetAt, type) {
   return Math.min(Math.max(expectedPercentage, 0), 100);
 }
 
-// Get card title
-function getCardTitle(type) {
-  const titles = {
-    'five_hour': '5 Hour',
-    'seven_day': '7 Day',
-    'seven_day_opus': '7D Opus',
-    'seven_day_oauth_apps': '7D OAuth'
+// Get card label from a limit entry (model display name, or a name derived from its kind)
+function getLimitLabel(limit) {
+  const modelName = limit.scope?.model?.display_name;
+  if (modelName) return modelName;
+
+  const labels = {
+    'session': '5 Hour',
+    'weekly_all': '7 Day'
   };
-  return titles[type] || type;
+  return labels[limit.kind] || limit.kind;
 }
 
 function createDonutChart(percentage, expectedPercentage, showPace) {
@@ -216,17 +200,15 @@ async function renderUsageData(data) {
   grid.className = 'usage-grid';
   grid.style.gridTemplateColumns = `repeat(${currentColumnCount}, 1fr)`;
 
-  for (const [type, info] of Object.entries(data)) {
-    if (!info) {
-      continue;
-    }
-
-    const utilization = info.utilization;
-    const resets_at = info.resets_at;
+  // Render every limit the API returns; inactive weekly limits (is_active: false)
+  // still have a reset time and are shown normally, matching the official usage page.
+  const limits = Array.isArray(data.limits) ? data.limits : [];
+  for (const limit of limits) {
+    const resets_at = limit.resets_at;
     const isDisabled = !resets_at;
 
-    const percentage = calculatePercentage(utilization, type);
-    const expectedPercentage = calculateExpectedPercentage(resets_at, type);
+    const percentage = Math.min(Math.max(limit.percent || 0, 0), 100);
+    const expectedPercentage = calculateExpectedPercentage(resets_at, limit.group);
     const resetTime = formatResetTime(resets_at);
 
     const visualElement = currentViewMode === 'donut'
@@ -244,7 +226,7 @@ async function renderUsageData(data) {
 
     const label = document.createElement('div');
     label.className = 'usage-label';
-    label.textContent = getCardTitle(type);
+    label.textContent = getLimitLabel(limit);
     infoRow.appendChild(label);
 
     const resetTimeDiv = document.createElement('div');

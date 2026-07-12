@@ -156,7 +156,31 @@
       display: flex;
       flex-direction: column;
       min-height: 0;
-      overflow: hidden;
+      overflow-y: auto;
+    }
+
+    .provider-sections {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 0;
+    }
+
+    .provider-section {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .provider-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: #667eea;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      flex-shrink: 0;
     }
 
     .usage-grid {
@@ -565,6 +589,10 @@
         color: #818cf8;
       }
 
+      .provider-title {
+        color: #818cf8;
+      }
+
       .last-updated {
         color: #9ca3af;
       }
@@ -805,6 +833,14 @@
         <option value="30">30 min</option>
         <option value="0">Off</option>
       </select>
+      <div class="modal-description">Codex (ChatGPT) Usage</div>
+      <div class="view-toggle" id="modalCodexToggleRow" style="justify-content: space-between; margin-bottom: 12px;">
+        <span class="pace-label">Enable Codex monitoring</span>
+        <div class="toggle-switch" id="modalCodexToggle">
+          <div class="toggle-slider"></div>
+        </div>
+      </div>
+      <input type="text" class="modal-input" id="modalChatgptAccountIdInput" placeholder="ChatGPT Account ID (optional)">
       <div class="modal-buttons">
         <button class="modal-button modal-button-secondary" id="modalCancelBtn">Cancel</button>
         <button class="modal-button modal-button-primary" id="modalSaveBtn">Save</button>

@@ -56,6 +56,41 @@ function getLimitLabel(limit) {
   return labels[limit.kind] || limit.kind;
 }
 
+// Normalize one Codex rate-limit window (primary/secondary) into { percent, resetsAt }
+function normalizeCodexWindow(window) {
+  if (!window) return null;
+
+  const percent = window.used_percent ?? window.percent;
+  if (typeof percent !== 'number') return null;
+
+  let resetsAt = null;
+  if (typeof window.reset_at === 'number') {
+    // reset_at is a Unix timestamp in seconds
+    resetsAt = new Date(window.reset_at * 1000).toISOString();
+  } else if (typeof window.reset_after_seconds === 'number') {
+    resetsAt = new Date(Date.now() + window.reset_after_seconds * 1000).toISOString();
+  }
+
+  return { percent, resetsAt };
+}
+
+// Convert a /backend-api/wham/usage response into limit entries matching Claude's shape
+// so they can reuse the same card rendering (kind 'session' -> 5 Hour, 'weekly_all' -> 7 Day).
+function extractCodexLimits(data) {
+  const rateLimit = data?.rate_limit || data || {};
+  const primary = normalizeCodexWindow(rateLimit.primary_window || rateLimit.primary);
+  const secondary = normalizeCodexWindow(rateLimit.secondary_window || rateLimit.secondary);
+
+  const limits = [];
+  if (primary) {
+    limits.push({ kind: 'session', group: 'session', percent: primary.percent, resets_at: primary.resetsAt });
+  }
+  if (secondary) {
+    limits.push({ kind: 'weekly_all', group: 'weekly', percent: secondary.percent, resets_at: secondary.resetsAt });
+  }
+  return limits;
+}
+
 function createDonutChart(percentage, expectedPercentage, showPace) {
   const outerRadius = 27;
   const innerRadius = 20;
@@ -179,30 +214,22 @@ function createProgressBar(percentage, expectedPercentage, showPace) {
 }
 
 let currentViewMode = 'donut';
-let cachedUsageData = null;
+let cachedClaudeData = null;
+let cachedClaudeError = null;
+let cachedCodexData = null;
+let cachedCodexError = null;
 let currentColumnCount = 2;
 let showPaceIndicator = false;
 let currentPollInterval = 5;
 let pollTimerId = null;
 
-async function renderUsageData(data) {
-  const contentDiv = document.getElementById('content');
-  cachedUsageData = data;
-
-  const storage = await chrome.storage.local.get(['viewMode', 'columnCount', 'showPace']);
-  currentViewMode = storage.viewMode || 'donut';
-  currentColumnCount = storage.columnCount || 2;
-  showPaceIndicator = storage.showPace || false;
-
-  contentDiv.textContent = '';
-
+// Render every limit the API returns; inactive weekly limits (is_active: false)
+// still have a reset time and are shown normally, matching the official usage page.
+function buildLimitsGrid(limits, viewMode, columnCount, showPace) {
   const grid = document.createElement('div');
   grid.className = 'usage-grid';
-  grid.style.gridTemplateColumns = `repeat(${currentColumnCount}, 1fr)`;
+  grid.style.gridTemplateColumns = `repeat(${columnCount}, 1fr)`;
 
-  // Render every limit the API returns; inactive weekly limits (is_active: false)
-  // still have a reset time and are shown normally, matching the official usage page.
-  const limits = Array.isArray(data.limits) ? data.limits : [];
   for (const limit of limits) {
     const resets_at = limit.resets_at;
     const isDisabled = !resets_at;
@@ -211,9 +238,9 @@ async function renderUsageData(data) {
     const expectedPercentage = calculateExpectedPercentage(resets_at, limit.group);
     const resetTime = formatResetTime(resets_at);
 
-    const visualElement = currentViewMode === 'donut'
-      ? createDonutChart(percentage, expectedPercentage, showPaceIndicator)
-      : createProgressBar(percentage, expectedPercentage, showPaceIndicator);
+    const visualElement = viewMode === 'donut'
+      ? createDonutChart(percentage, expectedPercentage, showPace)
+      : createProgressBar(percentage, expectedPercentage, showPace);
 
     const usageItem = document.createElement('div');
     usageItem.className = 'usage-item';
@@ -240,7 +267,76 @@ async function renderUsageData(data) {
     grid.appendChild(usageItem);
   }
 
-  contentDiv.appendChild(grid);
+  return grid;
+}
+
+// One provider's block within the popup: a header (only shown when multiple
+// providers are active) plus either its usage grid or an inline error.
+function buildProviderSection(title, limits, error, showHeader) {
+  const section = document.createElement('div');
+  section.className = 'provider-section';
+
+  // Grow each section in proportion to its own row count so that, when multiple
+  // providers are shown, every row ends up the same height instead of each section
+  // independently stretching to fill half the available space.
+  const rowCount = error ? 1 : Math.max(Math.ceil(limits.length / currentColumnCount), 1);
+  section.style.flexGrow = String(rowCount);
+  section.style.flexBasis = '0';
+
+  if (showHeader) {
+    const header = document.createElement('div');
+    header.className = 'provider-title';
+    header.textContent = title;
+    section.appendChild(header);
+  }
+
+  if (error) {
+    const errorDiv = document.createElement('div');
+    errorDiv.className = 'error';
+    errorDiv.textContent = error;
+    section.appendChild(errorDiv);
+  } else {
+    section.appendChild(buildLimitsGrid(limits, currentViewMode, currentColumnCount, showPaceIndicator));
+  }
+
+  return section;
+}
+
+async function renderUsageData() {
+  const contentDiv = document.getElementById('content');
+
+  const storage = await chrome.storage.local.get(['viewMode', 'columnCount', 'showPace', 'organizationId', 'codexEnabled']);
+  currentViewMode = storage.viewMode || 'donut';
+  currentColumnCount = storage.columnCount || 2;
+  showPaceIndicator = storage.showPace || false;
+
+  const showClaudeSection = !!storage.organizationId;
+  const showCodexSection = !!storage.codexEnabled;
+  const showProviderHeaders = showClaudeSection && showCodexSection;
+
+  contentDiv.textContent = '';
+
+  const sectionsWrapper = document.createElement('div');
+  sectionsWrapper.className = 'provider-sections';
+
+  if (showClaudeSection) {
+    const limits = cachedClaudeData && Array.isArray(cachedClaudeData.limits) ? cachedClaudeData.limits : [];
+    sectionsWrapper.appendChild(buildProviderSection('Claude', limits, cachedClaudeError, showProviderHeaders));
+  }
+
+  if (showCodexSection) {
+    let codexError = cachedCodexError;
+    let limits = [];
+    if (!codexError && cachedCodexData) {
+      limits = extractCodexLimits(cachedCodexData);
+      if (limits.length === 0) {
+        codexError = 'Unexpected response format from Codex usage API';
+      }
+    }
+    sectionsWrapper.appendChild(buildProviderSection('Codex', limits, codexError, showProviderHeaders));
+  }
+
+  contentDiv.appendChild(sectionsWrapper);
   updateViewSelectUI();
   updateColumnsUI();
   updatePaceToggleUI();
@@ -290,7 +386,7 @@ function showSetup() {
 
   const messageDiv = document.createElement('div');
   messageDiv.className = 'setup-message';
-  messageDiv.appendChild(document.createTextNode('Please configure Organization ID'));
+  messageDiv.appendChild(document.createTextNode('Please configure Organization ID or enable Codex monitoring'));
   messageDiv.appendChild(document.createElement('br'));
 
   const hintSpan = document.createElement('span');
@@ -327,14 +423,20 @@ function showSetup() {
   }
 }
 
+let modalCodexEnabled = false;
+
 async function openSettingsModal() {
   const modal = document.getElementById('settingsModal');
   const input = document.getElementById('modalOrgIdInput');
   const intervalSelect = document.getElementById('modalIntervalSelect');
+  const accountIdInput = document.getElementById('modalChatgptAccountIdInput');
 
-  const storage = await chrome.storage.local.get(['organizationId', 'pollInterval']);
+  const storage = await chrome.storage.local.get(['organizationId', 'pollInterval', 'codexEnabled', 'chatgptAccountId']);
   input.value = storage.organizationId || '';
   intervalSelect.value = String(storage.pollInterval !== undefined ? storage.pollInterval : 5);
+  accountIdInput.value = storage.chatgptAccountId || '';
+  modalCodexEnabled = storage.codexEnabled || false;
+  updateModalCodexToggleUI();
 
   modal.classList.add('active');
   input.focus();
@@ -345,13 +447,27 @@ function closeSettingsModal() {
   modal.classList.remove('active');
 }
 
+function updateModalCodexToggleUI() {
+  const toggle = document.getElementById('modalCodexToggle');
+  if (toggle) {
+    toggle.classList.toggle('active', modalCodexEnabled);
+  }
+}
+
+function toggleModalCodex() {
+  modalCodexEnabled = !modalCodexEnabled;
+  updateModalCodexToggleUI();
+}
+
 async function saveSettings() {
   const input = document.getElementById('modalOrgIdInput');
   const orgId = input.value.trim();
   const intervalSelect = document.getElementById('modalIntervalSelect');
   const pollInterval = Number(intervalSelect.value);
+  const accountIdInput = document.getElementById('modalChatgptAccountIdInput');
+  const chatgptAccountId = accountIdInput.value.trim();
 
-  const updates = { pollInterval };
+  const updates = { pollInterval, codexEnabled: modalCodexEnabled, chatgptAccountId };
   if (orgId) {
     updates.organizationId = orgId;
   }
@@ -361,9 +477,7 @@ async function saveSettings() {
   startPolling();
 
   closeSettingsModal();
-  if (orgId) {
-    loadUsageData();
-  }
+  loadUsageData();
 }
 
 function setRefreshSpinning(spinning) {
@@ -396,11 +510,96 @@ async function fetchUsageData(organizationId) {
   }
 }
 
+const CODEX_SESSION_CORS_RULE_ID = 1;
+const CODEX_USAGE_CORS_RULE_ID = 2;
+let codexCorsRulesReady = null;
+
+// Neither chatgpt.com endpoint below sends Access-Control-Allow-Origin, so direct
+// fetches from the extension's origin are blocked by CORS. This registers declarativeNetRequest
+// rules that stamp the extension's own origin (and the headers wham/usage needs) onto
+// those responses so the browser's CORS check passes, without any separate login/token.
+function ensureCodexCorsRules() {
+  if (!codexCorsRulesReady) {
+    const responseHeaders = [
+      { header: 'Access-Control-Allow-Origin', operation: 'set', value: `chrome-extension://${chrome.runtime.id}` },
+      { header: 'Access-Control-Allow-Credentials', operation: 'set', value: 'true' },
+      { header: 'Access-Control-Allow-Headers', operation: 'set', value: 'authorization, chatgpt-account-id, content-type' },
+      { header: 'Access-Control-Allow-Methods', operation: 'set', value: 'GET, OPTIONS' }
+    ];
+
+    codexCorsRulesReady = chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [CODEX_SESSION_CORS_RULE_ID, CODEX_USAGE_CORS_RULE_ID],
+      addRules: [
+        {
+          id: CODEX_SESSION_CORS_RULE_ID,
+          priority: 1,
+          condition: { urlFilter: '||chatgpt.com/api/auth/session', resourceTypes: ['xmlhttprequest'] },
+          action: { type: 'modifyHeaders', responseHeaders }
+        },
+        {
+          id: CODEX_USAGE_CORS_RULE_ID,
+          priority: 1,
+          condition: { urlFilter: '||chatgpt.com/backend-api/wham/usage', resourceTypes: ['xmlhttprequest'] },
+          action: { type: 'modifyHeaders', responseHeaders }
+        }
+      ]
+    });
+  }
+  return codexCorsRulesReady;
+}
+
+// chatgpt.com's session cookie alone isn't enough to authenticate against wham/usage;
+// it expects the same OAuth-style bearer token the Codex CLI/web app use, which the
+// logged-in browser session can hand out via its own NextAuth session endpoint.
+async function fetchCodexAccessToken() {
+  const response = await fetch('https://chatgpt.com/api/auth/session', {
+    credentials: 'include'
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (!data?.accessToken) {
+    throw new Error('Not logged into chatgpt.com');
+  }
+  return data.accessToken;
+}
+
+async function fetchCodexUsageData(accountId) {
+  try {
+    await ensureCodexCorsRules();
+
+    const accessToken = await fetchCodexAccessToken();
+
+    const headers = { Authorization: `Bearer ${accessToken}` };
+    if (accountId) {
+      headers['ChatGPT-Account-Id'] = accountId;
+    }
+
+    const response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
+      credentials: 'include',
+      headers
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error('Failed to fetch Codex usage data:', error);
+    throw error;
+  }
+}
+
 async function loadUsageData() {
   try {
-    const storage = await chrome.storage.local.get(['organizationId']);
+    const storage = await chrome.storage.local.get(['organizationId', 'codexEnabled', 'chatgptAccountId']);
+    const codexEnabled = !!storage.codexEnabled;
 
-    if (!storage.organizationId) {
+    if (!storage.organizationId && !codexEnabled) {
       showSetup();
       return;
     }
@@ -409,7 +608,7 @@ async function loadUsageData() {
 
     // Don't show loading screen if we have cached data
     // Just show the spinning icon in the header
-    if (!cachedUsageData) {
+    if (!cachedClaudeData && !cachedCodexData) {
       const contentDiv = document.getElementById('content');
       contentDiv.textContent = '';
 
@@ -427,9 +626,36 @@ async function loadUsageData() {
       contentDiv.appendChild(loadingDiv);
     }
 
-    const data = await fetchUsageData(storage.organizationId);
+    // Fetch each configured provider independently so a failure on one
+    // (e.g. Codex's undocumented API changing) doesn't blank out the other.
+    const tasks = [];
+
+    if (storage.organizationId) {
+      tasks.push(
+        fetchUsageData(storage.organizationId)
+          .then(data => { cachedClaudeData = data; cachedClaudeError = null; })
+          .catch(error => { cachedClaudeError = error.message; })
+      );
+    } else {
+      cachedClaudeData = null;
+      cachedClaudeError = null;
+    }
+
+    if (codexEnabled) {
+      tasks.push(
+        fetchCodexUsageData(storage.chatgptAccountId)
+          .then(data => { cachedCodexData = data; cachedCodexError = null; })
+          .catch(error => { cachedCodexError = error.message; })
+      );
+    } else {
+      cachedCodexData = null;
+      cachedCodexError = null;
+    }
+
+    await Promise.all(tasks);
+
     setRefreshSpinning(false);
-    renderUsageData(data);
+    await renderUsageData();
     updateLastUpdatedTime();
 
   } catch (error) {
@@ -478,8 +704,8 @@ async function changeViewMode(viewMode) {
   currentViewMode = viewMode;
   await chrome.storage.local.set({ viewMode: currentViewMode });
 
-  if (cachedUsageData) {
-    renderUsageData(cachedUsageData);
+  if (cachedClaudeData || cachedCodexData) {
+    renderUsageData();
   }
 }
 
@@ -487,8 +713,8 @@ async function changeColumnCount(columnCount) {
   currentColumnCount = parseInt(columnCount);
   await chrome.storage.local.set({ columnCount: currentColumnCount });
 
-  if (cachedUsageData) {
-    renderUsageData(cachedUsageData);
+  if (cachedClaudeData || cachedCodexData) {
+    renderUsageData();
   }
 }
 
@@ -496,8 +722,8 @@ async function togglePaceIndicator() {
   showPaceIndicator = !showPaceIndicator;
   await chrome.storage.local.set({ showPace: showPaceIndicator });
 
-  if (cachedUsageData) {
-    renderUsageData(cachedUsageData);
+  if (cachedClaudeData || cachedCodexData) {
+    renderUsageData();
   }
 }
 
@@ -549,6 +775,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const modalSaveBtn = document.getElementById('modalSaveBtn');
   if (modalSaveBtn) {
     modalSaveBtn.addEventListener('click', saveSettings);
+  }
+
+  const modalCodexToggle = document.getElementById('modalCodexToggle');
+  if (modalCodexToggle) {
+    modalCodexToggle.addEventListener('click', toggleModalCodex);
   }
 
   const modalOverlay = document.getElementById('settingsModal');

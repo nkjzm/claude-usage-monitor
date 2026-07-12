@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.0] - 2026-07-12
+
+- Added optional Codex (ChatGPT) usage monitoring, shown alongside Claude usage in the same popup
+- Codex usage is fetched using the browser's existing chatgpt.com session, matching how Claude usage is fetched (no separate login/token needed)
+
 ## [1.0.6] - 2026-03-05
 
 - Added request interval setting (contributed by [nkjzm](https://github.com/nkjzm))

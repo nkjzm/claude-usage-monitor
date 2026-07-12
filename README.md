@@ -33,6 +33,14 @@ https://microsoftedge.microsoft.com/addons/detail/ceongioipmlalfampnnbookfdphmeo
 - **Pace toggle**: When enabled, displays expected usage rate (purple) based on time elapsed
 - If actual usage exceeds expected usage, it indicates you're consuming credits faster than average
 
+### Codex (ChatGPT) Usage (optional)
+
+1. Open the settings icon (⚙️) and turn on "Enable Codex monitoring"
+2. Make sure you're logged into chatgpt.com in this browser — Codex usage is read from that session, no token entry needed
+3. If you belong to multiple ChatGPT workspaces, you can enter your ChatGPT Account ID to select the right one (leaving it blank works for most personal accounts; setting it may not work for all accounts due to browser CORS restrictions on this undocumented API)
+
+Codex usage is displayed in its own section below Claude's. Since it relies on an undocumented ChatGPT API, it may occasionally break if OpenAI changes it.
+
 ## Troubleshooting
 
 ### How to Find Organization ID

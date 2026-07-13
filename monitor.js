@@ -21,16 +21,18 @@ function formatResetTime(isoString) {
 }
 
 // Calculate expected usage percentage based on time elapsed
-function calculateExpectedPercentage(resetAt, group) {
+function calculateExpectedPercentage(resetAt, group, totalPeriodMsOverride) {
   if (!resetAt) return 0;
 
   const resetDate = new Date(resetAt);
   const now = new Date();
 
-  // Session limits reset every 5 hours; all other limits are weekly
-  const totalPeriod = group === 'session'
+  // Session limits reset every 5 hours; all other limits are weekly.
+  // Codex windows pass their actual duration explicitly instead, since Codex's
+  // window lengths aren't fixed to Claude's 5h/7d pattern.
+  const totalPeriod = totalPeriodMsOverride ?? (group === 'session'
     ? 5 * 60 * 60 * 1000
-    : 7 * 24 * 60 * 60 * 1000;
+    : 7 * 24 * 60 * 60 * 1000);
 
   // Calculate elapsed time
   const timeRemaining = resetDate - now;
@@ -56,7 +58,17 @@ function getLimitLabel(limit) {
   return labels[limit.kind] || limit.kind;
 }
 
-// Normalize one Codex rate-limit window (primary/secondary) into { percent, resetsAt }
+// Label a Codex window by its actual duration (e.g. "5 Hour", "7 Day") rather than
+// assuming a fixed meaning, since OpenAI has changed what primary/secondary represent.
+function codexWindowLabel(windowSeconds) {
+  if (typeof windowSeconds !== 'number' || windowSeconds <= 0) return 'Usage';
+  const hours = windowSeconds / 3600;
+  if (hours < 24) return `${Math.round(hours)} Hour`;
+  return `${Math.round(windowSeconds / 86400)} Day`;
+}
+
+// Normalize one Codex rate-limit window (primary/secondary) into a limit entry
+// matching Claude's shape, so it can reuse the same card rendering.
 function normalizeCodexWindow(window) {
   if (!window) return null;
 
@@ -71,24 +83,25 @@ function normalizeCodexWindow(window) {
     resetsAt = new Date(Date.now() + window.reset_after_seconds * 1000).toISOString();
   }
 
-  return { percent, resetsAt };
+  const windowSeconds = window.limit_window_seconds;
+  return {
+    kind: codexWindowLabel(windowSeconds),
+    group: typeof windowSeconds === 'number' && windowSeconds <= 24 * 60 * 60 ? 'session' : 'weekly',
+    totalPeriodMs: typeof windowSeconds === 'number' ? windowSeconds * 1000 : undefined,
+    percent,
+    resets_at: resetsAt
+  };
 }
 
 // Convert a /backend-api/wham/usage response into limit entries matching Claude's shape
-// so they can reuse the same card rendering (kind 'session' -> 5 Hour, 'weekly_all' -> 7 Day).
+// so they can reuse the same card rendering. primary_window/secondary_window are just
+// slots - which one is the 5-hour vs weekly window (or whether both are even present)
+// is determined per-window from limit_window_seconds, not from its slot.
 function extractCodexLimits(data) {
   const rateLimit = data?.rate_limit || data || {};
-  const primary = normalizeCodexWindow(rateLimit.primary_window || rateLimit.primary);
-  const secondary = normalizeCodexWindow(rateLimit.secondary_window || rateLimit.secondary);
-
-  const limits = [];
-  if (primary) {
-    limits.push({ kind: 'session', group: 'session', percent: primary.percent, resets_at: primary.resetsAt });
-  }
-  if (secondary) {
-    limits.push({ kind: 'weekly_all', group: 'weekly', percent: secondary.percent, resets_at: secondary.resetsAt });
-  }
-  return limits;
+  return [rateLimit.primary_window || rateLimit.primary, rateLimit.secondary_window || rateLimit.secondary]
+    .map(normalizeCodexWindow)
+    .filter(Boolean);
 }
 
 function createDonutChart(percentage, expectedPercentage, showPace) {
@@ -235,7 +248,7 @@ function buildLimitsGrid(limits, viewMode, columnCount, showPace) {
     const isDisabled = !resets_at;
 
     const percentage = Math.min(Math.max(limit.percent || 0, 0), 100);
-    const expectedPercentage = calculateExpectedPercentage(resets_at, limit.group);
+    const expectedPercentage = calculateExpectedPercentage(resets_at, limit.group, limit.totalPeriodMs);
     const resetTime = formatResetTime(resets_at);
 
     const visualElement = viewMode === 'donut'
